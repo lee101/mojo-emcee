@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import atexit
 import ctypes
 import os
 import shutil
 import subprocess
 import sys
-import threading
 
 import numpy as np
 
@@ -77,9 +75,6 @@ def build(force: bool = False) -> str:
 
 
 _loaded = None
-_runtime_devices = []
-_runtime_lock = threading.Lock()
-_runtime_local = threading.local()
 
 
 def lib() -> ctypes.CDLL:
@@ -94,32 +89,8 @@ def lib() -> ctypes.CDLL:
 
 
 def parallel_lib() -> ctypes.CDLL:
-    handle = lib()
-    if getattr(_runtime_local, "device", None) is None:
-        with _runtime_lock:
-            getter = handle.KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice
-            getter.argtypes = []
-            getter.restype = ctypes.c_void_p
-            device = getter()
-            if not device:
-                raise RuntimeError("failed to initialize the Mojo CPU runtime")
-            _runtime_local.device = device
-            _runtime_devices.append(device)
-    return handle
-
-
-def _release_runtime_devices() -> None:
-    if _loaded is None or not _runtime_devices:
-        return
-    release = _loaded.KGEN_CompilerRT_AsyncRT_ReleaseCPUDevice
-    release.argtypes = [ctypes.c_void_p]
-    release.restype = None
-    for device in _runtime_devices:
-        release(device)
-    _runtime_devices.clear()
-
-
-atexit.register(_release_runtime_devices)
+    """Return the kernel library without the removed Mojo AsyncRT bootstrap."""
+    return lib()
 
 
 def f64(value, *, copy: bool = False) -> np.ndarray:

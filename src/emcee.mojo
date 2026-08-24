@@ -1,6 +1,5 @@
 """Numerical kernels for the affine-invariant ensemble sampler."""
 
-from std.algorithm.functional import parallelize
 from std.math import cos, log, sin
 from std.sys.info import simd_width_of
 
@@ -119,7 +118,10 @@ def fft_stage_parallel(
                 wi = wr * wi_step + wi * wr_step
                 wr = next_wr
 
-    parallelize[process_blocks](FFT_PARALLEL_TASKS)
+    # `parallelize` moved out of the Mojo standard library in 1.1. Keep the
+    # existing task partitioning while running the independent blocks here.
+    for task in range(FFT_PARALLEL_TASKS):
+        process_blocks(task)
 
 
 def fft_in_place(real: FPtr, imag: FPtr, n: Int, inverse: Bool):
