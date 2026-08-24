@@ -84,16 +84,19 @@ number generation. The shared library is warmed before timing.
 
 | case | mojo-emcee | emcee 3.1.6 | result |
 | --- | ---: | ---: | ---: |
-| StretchMove proposal (32,768 walkers x 64d) | 11.51 ms | 85.15 ms | 7.40x faster |
-| `autocorr.function_1d` (262,144 samples) | 50.45 ms | 85.85 ms | 1.70x faster |
-| EnsembleSampler, vectorized log-prob (4,096 x 32d x 40) | 131.57 ms | 441.71 ms | 3.36x faster |
+| StretchMove proposal (32,768 walkers x 64d) | 8.61 ms | 170.18 ms | 19.77x faster |
+| `autocorr.function_1d` (262,144 samples) | 29.04 ms | 69.20 ms | 2.38x faster |
+| EnsembleSampler, vectorized log-prob (4,096 x 32d x 40) | 128.13 ms | 371.00 ms | 2.90x faster |
 
 These results describe this machine and pinned environment, not a general
 performance guarantee. Real sampling speed is often dominated by the user's
 log-probability function; expensive Python likelihoods reduce the relative
 benefit of accelerating the transition itself.
 
-No GPU path is provided.
+No GPU path is provided because these kernels do not have the arithmetic
+intensity to justify one. An FFT butterfly moves about 64 bytes for roughly
+10--12 floating-point operations (about 0.2 flop/byte), far below the
+2 flop/byte cutoff where device transfer and launch costs become plausible.
 
 ## How it works
 
@@ -115,12 +118,15 @@ in place. NumPy computes the small logarithmic stretch-factor vector because
 the pinned nightly's fast Mojo logarithm is not accurate enough for
 acceptance decisions near the threshold.
 
-Autocorrelation uses a zero-padded iterative radix-2 FFT written in Mojo.
-Buffer preparation, the power spectrum, and normalization use hardware-width
-SIMD with scalar tails. FFT stages at 131,072 points and above are divided
-across CPU workers; smaller transforms remain serial to avoid scheduling
-overhead. Its normalization and Sokal window selection match emcee's
-implementation; only the FFT and power-spectrum work crosses the FFI boundary.
+Autocorrelation uses a zero-padded iterative radix-2 FFT written in Mojo. A
+forward decimation-in-frequency transform feeds an inverse
+decimation-in-time transform, avoiding both bit-reversal passes. FFT
+butterflies, buffer preparation, the power spectrum, and normalization use
+hardware-width SIMD with scalar tails. The returned array aliases the real
+FFT workspace instead of requiring a separate output allocation. Independent
+per-walker transforms in `integrated_time` use CPU workers only when the total
+work reaches 262,144 samples; smaller jobs stay serial. Normalization and
+Sokal window selection match emcee's implementation.
 
 ## Development
 

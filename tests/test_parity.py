@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import emcee
 import mojo_emcee as memcee
 from mojo_emcee import _lib
+from mojo_emcee import autocorr as memcee_autocorr
 
 
 def gaussian_log_prob(point):
@@ -338,8 +339,14 @@ def test_autocorrelation_function_matches_upstream(n):
     )
 
 
+def test_autocorrelation_result_aliases_fft_workspace():
+    result = memcee.autocorr.function_1d(np.arange(17.0))
+    assert result.base is not None
+    assert result.base.shape == (64,)
+
+
 @pytest.mark.parametrize("n", [32768, 65535])
-def test_autocorrelation_serial_and_parallel_thresholds_match_upstream(n):
+def test_autocorrelation_large_simd_and_tail_lengths_match_upstream(n):
     values = np.random.default_rng(n).normal(size=n)
     assert np.allclose(
         memcee.autocorr.function_1d(values),
@@ -372,6 +379,16 @@ def test_integrated_time_1d_matches_upstream():
 def test_integrated_time_walker_chain_matches_upstream():
     rng = np.random.default_rng(1)
     values = np.cumsum(rng.normal(size=(2048, 8, 3)), axis=0)
+    ours = memcee.autocorr.integrated_time(values, quiet=True)
+    theirs = emcee.autocorr.integrated_time(values, quiet=True)
+    assert np.allclose(ours, theirs, rtol=2e-12, atol=2e-12)
+
+
+def test_integrated_time_parallel_threshold_matches_upstream(monkeypatch):
+    monkeypatch.setattr(memcee_autocorr, "_PARALLEL_WORK_THRESHOLD", 1)
+    values = np.cumsum(
+        np.random.default_rng(11).normal(size=(512, 4, 2)), axis=0
+    )
     ours = memcee.autocorr.integrated_time(values, quiet=True)
     theirs = emcee.autocorr.integrated_time(values, quiet=True)
     assert np.allclose(ours, theirs, rtol=2e-12, atol=2e-12)

@@ -5,8 +5,6 @@ from std.sys.info import simd_width_of
 
 comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
-comptime FFT_PARALLEL_THRESHOLD = 131_072
-comptime FFT_PARALLEL_TASKS = 16
 
 
 def fp(addr: Int) -> FPtr:
@@ -69,24 +67,7 @@ def accept_proposals(
     return count
 
 
-def bit_reverse(real: FPtr, imag: FPtr, n: Int):
-    var j = 0
-    for i in range(1, n):
-        var bit = n >> 1
-        while j & bit:
-            j ^= bit
-            bit >>= 1
-        j ^= bit
-        if i < j:
-            var tr = real[i]
-            real[i] = real[j]
-            real[j] = tr
-            var ti = imag[i]
-            imag[i] = imag[j]
-            imag[j] = ti
-
-
-def fft_stage_parallel(
+def fft_stage_dit(
     real: FPtr,
     imag: FPtr,
     n: Int,
@@ -94,68 +75,149 @@ def fft_stage_parallel(
     wr_step: Float64,
     wi_step: Float64,
 ):
-    @parameter
-    def process_blocks(task: Int):
-        var first = task * (n // width) // FFT_PARALLEL_TASKS
-        var last = (task + 1) * (n // width) // FFT_PARALLEL_TASKS
-        for block in range(first, last):
-            var base = block * width
-            var wr = 1.0
-            var wi = 0.0
-            var half = width >> 1
-            for k in range(half):
-                var even = base + k
-                var odd = even + half
-                var tr = wr * real[odd] - wi * imag[odd]
-                var ti = wr * imag[odd] + wi * real[odd]
-                var er = real[even]
-                var ei = imag[even]
-                real[even] = er + tr
-                imag[even] = ei + ti
-                real[odd] = er - tr
-                imag[odd] = ei - ti
-                var next_wr = wr * wr_step - wi * wi_step
-                wi = wr * wi_step + wi * wr_step
-                wr = next_wr
+    comptime W = simd_width_of[DType.float64]()
+    var half = width >> 1
+    var initial_wr = SIMD[DType.float64, W](0.0)
+    var initial_wi = SIMD[DType.float64, W](0.0)
+    var wr = 1.0
+    var wi = 0.0
+    for lane in range(W):
+        initial_wr[lane] = wr
+        initial_wi[lane] = wi
+        var next_wr = wr * wr_step - wi * wi_step
+        wi = wr * wi_step + wi * wr_step
+        wr = next_wr
+    var advance_wr = wr
+    var advance_wi = wi
 
-    # `parallelize` moved out of the Mojo standard library in 1.1. Keep the
-    # existing task partitioning while running the independent blocks here.
-    for task in range(FFT_PARALLEL_TASKS):
-        process_blocks(task)
+    var base = 0
+    while base < n:
+        var k = 0
+        var wr_vector = initial_wr
+        var wi_vector = initial_wi
+        while k + W <= half:
+            var even_real = real.load[width=W](base + k)
+            var even_imag = imag.load[width=W](base + k)
+            var odd_real = real.load[width=W](base + half + k)
+            var odd_imag = imag.load[width=W](base + half + k)
+            var tr = wr_vector * odd_real - wi_vector * odd_imag
+            var ti = wr_vector * odd_imag + wi_vector * odd_real
+            real.store(base + k, even_real + tr)
+            imag.store(base + k, even_imag + ti)
+            real.store(base + half + k, even_real - tr)
+            imag.store(base + half + k, even_imag - ti)
+            var next_wr = (
+                wr_vector * advance_wr - wi_vector * advance_wi
+            )
+            wi_vector = wr_vector * advance_wi + wi_vector * advance_wr
+            wr_vector = next_wr
+            k += W
+        wr = wr_vector[0]
+        wi = wi_vector[0]
+        while k < half:
+            var even = base + k
+            var odd = even + half
+            var tr = wr * real[odd] - wi * imag[odd]
+            var ti = wr * imag[odd] + wi * real[odd]
+            var er = real[even]
+            var ei = imag[even]
+            real[even] = er + tr
+            imag[even] = ei + ti
+            real[odd] = er - tr
+            imag[odd] = ei - ti
+            var next_wr = wr * wr_step - wi * wi_step
+            wi = wr * wi_step + wi * wr_step
+            wr = next_wr
+            k += 1
+        base += width
 
 
-def fft_in_place(real: FPtr, imag: FPtr, n: Int, inverse: Bool):
-    bit_reverse(real, imag, n)
+def fft_stage_dif(
+    real: FPtr,
+    imag: FPtr,
+    n: Int,
+    width: Int,
+    wr_step: Float64,
+    wi_step: Float64,
+):
+    comptime W = simd_width_of[DType.float64]()
+    var half = width >> 1
+    var initial_wr = SIMD[DType.float64, W](0.0)
+    var initial_wi = SIMD[DType.float64, W](0.0)
+    var wr = 1.0
+    var wi = 0.0
+    for lane in range(W):
+        initial_wr[lane] = wr
+        initial_wi[lane] = wi
+        var next_wr = wr * wr_step - wi * wi_step
+        wi = wr * wi_step + wi * wr_step
+        wr = next_wr
+    var advance_wr = wr
+    var advance_wi = wi
+
+    var base = 0
+    while base < n:
+        var k = 0
+        var wr_vector = initial_wr
+        var wi_vector = initial_wi
+        while k + W <= half:
+            var even_real = real.load[width=W](base + k)
+            var even_imag = imag.load[width=W](base + k)
+            var odd_real = real.load[width=W](base + half + k)
+            var odd_imag = imag.load[width=W](base + half + k)
+            var diff_real = even_real - odd_real
+            var diff_imag = even_imag - odd_imag
+            real.store(base + k, even_real + odd_real)
+            imag.store(base + k, even_imag + odd_imag)
+            real.store(
+                base + half + k,
+                wr_vector * diff_real - wi_vector * diff_imag,
+            )
+            imag.store(
+                base + half + k,
+                wr_vector * diff_imag + wi_vector * diff_real,
+            )
+            var next_wr = (
+                wr_vector * advance_wr - wi_vector * advance_wi
+            )
+            wi_vector = wr_vector * advance_wi + wi_vector * advance_wr
+            wr_vector = next_wr
+            k += W
+        wr = wr_vector[0]
+        wi = wi_vector[0]
+        while k < half:
+            var even = base + k
+            var odd = even + half
+            var er = real[even]
+            var ei = imag[even]
+            var dr = er - real[odd]
+            var di = ei - imag[odd]
+            real[even] = er + real[odd]
+            imag[even] = ei + imag[odd]
+            real[odd] = wr * dr - wi * di
+            imag[odd] = wr * di + wi * dr
+            var next_wr = wr * wr_step - wi * wi_step
+            wi = wr * wi_step + wi * wr_step
+            wr = next_wr
+            k += 1
+        base += width
+
+
+def fft_forward_dif(real: FPtr, imag: FPtr, n: Int):
+    var width = n
+    while width >= 2:
+        var angle = -6.283185307179586476925286766559 / Float64(width)
+        fft_stage_dif(real, imag, n, width, cos(angle), sin(angle))
+        width >>= 1
+
+
+def fft_inverse_dit(real: FPtr, imag: FPtr, n: Int):
     var width = 2
     while width <= n:
         var angle = 6.283185307179586476925286766559 / Float64(width)
-        if not inverse:
-            angle = -angle
         var wr_step = cos(angle)
         var wi_step = sin(angle)
-        if n >= FFT_PARALLEL_THRESHOLD:
-            fft_stage_parallel(real, imag, n, width, wr_step, wi_step)
-        else:
-            var base = 0
-            while base < n:
-                var wr = 1.0
-                var wi = 0.0
-                var half = width >> 1
-                for k in range(half):
-                    var even = base + k
-                    var odd = even + half
-                    var tr = wr * real[odd] - wi * imag[odd]
-                    var ti = wr * imag[odd] + wi * real[odd]
-                    var er = real[even]
-                    var ei = imag[even]
-                    real[even] = er + tr
-                    imag[even] = ei + ti
-                    real[odd] = er - tr
-                    imag[odd] = ei - ti
-                    var next_wr = wr * wr_step - wi * wi_step
-                    wi = wr * wi_step + wi * wr_step
-                    wr = next_wr
-                base += width
+        fft_stage_dit(real, imag, n, width, wr_step, wi_step)
         width <<= 1
 
 
@@ -198,7 +260,7 @@ def autocorrelation_1d(
         work_imag[i] = 0.0
         i += 1
 
-    fft_in_place(work_real, work_imag, fft_size, False)
+    fft_forward_dif(work_real, work_imag, fft_size)
     i = 0
     while i + W <= fft_size:
         var re = work_real.load[width=W](i)
@@ -212,7 +274,7 @@ def autocorrelation_1d(
         )
         work_imag[i] = 0.0
         i += 1
-    fft_in_place(work_real, work_imag, fft_size, True)
+    fft_inverse_dit(work_real, work_imag, fft_size)
 
     var norm = work_real[0]
     i = 0

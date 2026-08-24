@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
 from ._lib import autocorrelation_1d, f64
 
 logger = logging.getLogger(__name__)
+
+_PARALLEL_WORK_THRESHOLD = 262_144
 
 
 def next_pow_two(n):
@@ -23,9 +27,9 @@ def function_1d(x):
     if len(values) == 0:
         raise ValueError("cannot autocorrelate an empty series")
     fft_size = 2 * next_pow_two(len(values))
-    result = np.empty(len(values), dtype=np.float64)
     work_real = np.empty(fft_size, dtype=np.float64)
     work_imag = np.empty(fft_size, dtype=np.float64)
+    result = work_real[: len(values)]
     autocorrelation_1d(values, result, work_real, work_imag)
     return result
 
@@ -53,8 +57,18 @@ def integrated_time(x, c=5, tol=50, quiet=False, has_walkers=True):
     tau_est = np.empty(n_d)
     for d in range(n_d):
         acf = np.zeros(n_t)
-        for walker in range(n_w):
-            acf += function_1d(values[:, walker, d])
+        if n_w > 1 and n_t * n_w >= _PARALLEL_WORK_THRESHOLD:
+            workers = min(n_w, os.cpu_count() or 1)
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                correlations = executor.map(
+                    function_1d,
+                    (values[:, walker, d] for walker in range(n_w)),
+                )
+                for correlation in correlations:
+                    acf += correlation
+        else:
+            for walker in range(n_w):
+                acf += function_1d(values[:, walker, d])
         acf /= n_w
         taus = 2.0 * np.cumsum(acf) - 1.0
         tau_est[d] = taus[auto_window(taus, c)]
