@@ -140,11 +140,6 @@ one vector halves their loads and stores, but the dialect has no lane-sweep
 shuffle for the odd/even deinterleave, and the substitute shuffles cost more
 than the 4 multiplies and 2 adds they replace.
 
-No GPU path is provided because these kernels do not have the arithmetic
-intensity to justify one. An FFT butterfly moves about 64 bytes for roughly
-10--12 floating-point operations (about 0.2 flop/byte), far below the
-2 flop/byte cutoff where device transfer and launch costs become plausible.
-
 ### Thread parallelism: tried, measured, not enabled
 
 `max.algorithm.parallelize` (the only live path on this toolchain) resolves
@@ -213,6 +208,40 @@ did not change. `pixi run bench` on the unchanged tree measured 7.54 ms
 measured 8.49 ms, 30.62 ms, and 147.91 ms. Those differences are host noise:
 the emcee column moved from 42.61/67.74/375.38 ms to
 43.47/63.25/568.03 ms on the same code.
+
+### GPU: CPU only: memory-bound
+
+No GPU path ships. All three exported kernels are memory-bound, roughly an
+order of magnitude below the ~2 flop/byte floor where a PCIe copy plus launch
+would pay for itself. The intensity gate therefore stops the phase before any
+device code is written; no kernel was ported and no Python entry point changed.
+
+The gate was evaluated against the exported kernels in `src/emcee.mojo`, since
+`bench/analysis.md` referenced by the phase brief is not present in this
+repository or its history. Intensities count every float64 byte moved
+(read + write) per kernel:
+
+| kernel | bytes per unit of work | flops per unit | flop/byte |
+| --- | ---: | ---: | ---: |
+| `stretch_proposal`, per dim | 24 (read `s`, read `c`, write `proposal`) | 3 | 0.125 |
+| `accept_proposals`, per dim | 16 (read `proposal`, write `coords`) | 0 | ~0 |
+| FFT butterfly, per site | 64 (four loads, four stores) | 10--16 | 0.16--0.25 |
+
+The transfer side is worse than the ratio alone suggests. The benchmarked
+caller, 32,768 walkers x 64 dims, already holds 16 MiB per matrix, so
+`sample` + `complement` + `proposal` is 48 MiB of unavoidable traffic each way
+before a single flop runs, against a stretch call the benchmark already
+completes in single-digit milliseconds on the CPU. The many small calls a
+real blue/red step makes (24 x 5 in the README example) are far below that.
+
+The shared device did have room: `nvidia-smi --query-gpu=memory.free
+--format=csv,noheader` reported 5294 MiB free, above the 4000 MiB floor, so the
+memory gate was not the reason for stopping. The intensity gate was.
+
+Because no GPU code exists, the suite has no GPU test to skip; `pixi run test`
+passes on CPU-only hosts as before. If a future kernel lands above 2 flop/byte,
+it would need a device path behind a runtime probe, the CPU path kept as the
+fallback, and GPU tests that skip cleanly when no device is present.
 
 ## How it works
 
