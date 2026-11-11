@@ -145,6 +145,75 @@ intensity to justify one. An FFT butterfly moves about 64 bytes for roughly
 10--12 floating-point operations (about 0.2 flop/byte), far below the
 2 flop/byte cutoff where device transfer and launch costs become plausible.
 
+### Thread parallelism: tried, measured, not enabled
+
+`max.algorithm.parallelize` (the only live path on this toolchain) resolves
+once the pinned `max` package is installed, so it was added to `pixi.toml`
+beside the mojo pin. It works from the ctypes host: a probe kernel produced
+identical output at 1, 2, 4 and 8 workers. Enabling it in the library did not
+pay, and no parallel path is shipped. These are raw kernel timings, best of
+nine, excluding the Python wrapper.
+
+Stretch proposal, serial SIMD kernel versus rows split across workers:
+
+| walkers x dims | serial | w=1 | w=2 | w=4 |
+| --- | ---: | ---: | ---: | ---: |
+| 1,024 x 32 | 85.7 us | 2.25x | 0.02x | 0.02x |
+| 4,096 x 32 | 216.5 us | 1.36x | 0.05x | 0.05x |
+| 16,384 x 32 | 667.0 us | 1.11x | 0.13x | 0.13x |
+| 32,768 x 64 | 3,967.5 us | 1.06x | 0.44x | 0.51x |
+| 262,144 x 64 | 49.1 ms | 1.04x | 1.33x | 1.79x |
+| 1,048,576 x 64 | 227.6 ms | 1.04x | 1.90x | 2.88x |
+| 4,194,304 x 64 | 979.8 ms | 0.99x | 1.52x | 2.53x |
+
+The crossover is between 65k and 260k walker rows, and the margin above it is
+large: the benchmarked and documented caller, 32,768 x 64, runs at 0.44x (two
+workers) to 0.51x (four) of serial. Ten times that size only reaches
+1.33x--1.79x, nowhere near four, and doubling again to 4.2M rows falls back
+to 1.52x--2.53x, so the gain flattens and reverses as rows grow. At the sizes a
+real blue/red step already passes, parallelism is not merely unprofitable, it
+is catastrophic:
+
+| half-ensemble | serial | w=2 | w=4 |
+| --- | ---: | ---: | ---: |
+| 12 x 5 (the README's 24 walkers) | 87.3 us | 0.02x | 0.02x |
+| 2,048 x 32 (the benchmark's 4,096 walkers) | 146.5 us | 0.03x | 0.03x |
+
+A threshold above the crossover would leave the shipped library serial
+everywhere it is actually called, so the parallel stretch path was dropped
+rather than shipped dead.
+
+The `w=1` column runs the same loop with no pool involved and is within 6% of
+the shipped kernel above 32k rows (the 2.25x at 1,024 rows is timer noise on an
+85 us call). Everything except it is dominated by the `max` CPU thread pool:
+it launches one thread per host CPU at first use (73 threads here, 16 ms for
+the very first call) and every later `parallelize` call costs 9--36 ms of pool
+traffic before any work starts, independent of the worker count. Restricting
+the process to two CPUs drops that to about 0.5--0.7 ms, but the library
+cannot do that to its host, and below that pool size there is nothing to gain
+from workers anyway.
+
+Splitting FFT stages across groups was also attempted for
+`autocorrelation_1d`. Stages with several independent radix groups (every
+width below `fft_size`) matched the serial stage bit for bit. The first stage,
+`width == fft_size`, has one group no matter the worker count, and
+parallelising it corrupted the heap and crashed the process inside the pool,
+whether one or many workers were requested; its output was never verified.
+Stage-level parallelism was abandoned rather than shipped unverified.
+
+Decision: serial is what ships. `integrated_time` still uses Python worker
+threads for independent per-walker transforms above its existing 262,144
+sample threshold; that predates this pass and calls the serial kernel per
+walker, so it does not use the Mojo pool.
+
+No behavioural `before/after` table is given here because the shipped library
+did not change. `pixi run bench` on the unchanged tree measured 7.54 ms
+(StretchMove), 32.11 ms (`autocorr.function_1d`), and 127.15 ms
+(`EnsembleSampler`); the baseline run before this pass on the same machine
+measured 8.49 ms, 30.62 ms, and 147.91 ms. Those differences are host noise:
+the emcee column moved from 42.61/67.74/375.38 ms to
+43.47/63.25/568.03 ms on the same code.
+
 ## How it works
 
 Python owns every allocation. Coordinates are C-contiguous row-major
@@ -170,10 +239,11 @@ forward decimation-in-frequency transform feeds an inverse
 decimation-in-time transform, avoiding both bit-reversal passes. FFT
 butterflies, buffer preparation, the power spectrum, and normalization use
 hardware-width SIMD with scalar tails. The returned array aliases the real
-FFT workspace instead of requiring a separate output allocation. Independent
-per-walker transforms in `integrated_time` use CPU workers only when the total
-work reaches 262,144 samples; smaller jobs stay serial. Normalization and
-Sokal window selection match emcee's implementation.
+FFT workspace instead of requiring a separate output allocation. Each FFT runs
+serial in Mojo; the only threading anywhere is in `integrated_time`, which
+dispatches independent per-walker transforms to Python worker threads when the
+total work reaches 262,144 samples, and leaves smaller jobs serial.
+Normalization and Sokal window selection match emcee's implementation.
 
 ## Development
 
