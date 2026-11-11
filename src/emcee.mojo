@@ -96,10 +96,10 @@ def fft_stage_dit(
         var wr_vector = initial_wr
         var wi_vector = initial_wi
         while k + W <= half:
-            var even_real = real.load[width=W](base + k)
-            var even_imag = imag.load[width=W](base + k)
-            var odd_real = real.load[width=W](base + half + k)
-            var odd_imag = imag.load[width=W](base + half + k)
+            var even_real = real.unsafe_load[width=W](base + k)
+            var even_imag = imag.unsafe_load[width=W](base + k)
+            var odd_real = real.unsafe_load[width=W](base + half + k)
+            var odd_imag = imag.unsafe_load[width=W](base + half + k)
             var tr = wr_vector * odd_real - wi_vector * odd_imag
             var ti = wr_vector * odd_imag + wi_vector * odd_real
             real.store(base + k, even_real + tr)
@@ -161,10 +161,10 @@ def fft_stage_dif(
         var wr_vector = initial_wr
         var wi_vector = initial_wi
         while k + W <= half:
-            var even_real = real.load[width=W](base + k)
-            var even_imag = imag.load[width=W](base + k)
-            var odd_real = real.load[width=W](base + half + k)
-            var odd_imag = imag.load[width=W](base + half + k)
+            var even_real = real.unsafe_load[width=W](base + k)
+            var even_imag = imag.unsafe_load[width=W](base + k)
+            var odd_real = real.unsafe_load[width=W](base + half + k)
+            var odd_imag = imag.unsafe_load[width=W](base + half + k)
             var diff_real = even_real - odd_real
             var diff_imag = even_imag - odd_imag
             real.store(base + k, even_real + odd_real)
@@ -233,7 +233,7 @@ def autocorrelation_1d(
     var mean_vector = SIMD[DType.float64, W](0.0)
     var i = 0
     while i + W <= n:
-        mean_vector += values.load[width=W](i)
+        mean_vector += values.unsafe_load[width=W](i)
         i += W
     var mean = mean_vector.reduce_add()
     while i < n:
@@ -244,7 +244,7 @@ def autocorrelation_1d(
     i = 0
     var zeros = SIMD[DType.float64, W](0.0)
     while i + W <= n:
-        work_real.store(i, values.load[width=W](i) - mean)
+        work_real.store(i, values.unsafe_load[width=W](i) - mean)
         work_imag.store(i, zeros)
         i += W
     while i < n:
@@ -263,8 +263,8 @@ def autocorrelation_1d(
     fft_forward_dif(work_real, work_imag, fft_size)
     i = 0
     while i + W <= fft_size:
-        var re = work_real.load[width=W](i)
-        var im = work_imag.load[width=W](i)
+        var re = work_real.unsafe_load[width=W](i)
+        var im = work_imag.unsafe_load[width=W](i)
         work_real.store(i, re * re + im * im)
         work_imag.store(i, zeros)
         i += W
@@ -279,7 +279,7 @@ def autocorrelation_1d(
     var norm = work_real[0]
     i = 0
     while i + W <= n:
-        result.store(i, work_real.load[width=W](i) / norm)
+        result.store(i, work_real.unsafe_load[width=W](i) / norm)
         i += W
     while i < n:
         result[i] = work_real[i] / norm
