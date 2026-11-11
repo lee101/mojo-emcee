@@ -26,8 +26,14 @@ def stretch_proposal(
     nc: Int,
     ndim: Int,
 ):
+    # Rows are contiguous. Every row is visited exactly once and the proposal
+    # row never aliases sample or complement, so vectorising across ndim is
+    # safe; the residual dims run through the scalar tail.
+    comptime W = simd_width_of[DType.float64]()
+    var z_vector = SIMD[DType.float64, W](0.0)
     for i in range(ns):
         var z = scales[i]
+        z_vector = z
         var partner = Int(partners[i])
         if partner < 0:
             partner = 0
@@ -35,9 +41,21 @@ def stretch_proposal(
             partner = nc - 1
         var srow = i * ndim
         var crow = partner * ndim
-        for d in range(ndim):
-            var c = complement[crow + d]
-            proposal[srow + d] = c - (c - sample[srow + d]) * z
+        var d = 0
+        while d + W <= ndim:
+            var c = complement.unsafe_load[width=W](crow + d)
+            var s = sample.unsafe_load[width=W](srow + d)
+            proposal.store(srow + d, c - (c - s) * z_vector)
+            d += W
+        while d < ndim:
+            var c = complement.unsafe_load(crow + d)
+            proposal.store(
+                srow + d, c - (c - sample.unsafe_load(srow + d)) * z
+            )
+            d += 1
+        # Deliberately NOT fused here: moving this into the row loop makes the
+        # output come from the Mojo `log`, whose relative error is ~3e-9 and
+        # breaks the acceptance-factor parity contract (see README).
         factors[i] = Float64(ndim - 1) * log(z)
 
 

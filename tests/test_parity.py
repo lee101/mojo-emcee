@@ -415,6 +415,173 @@ def test_autocorr_error_exposes_matching_estimate():
     assert np.allclose(ours.value.tau, theirs.value.tau)
 
 
+# Every SIMD kernel loops `i + W <= n` and then finishes with a scalar tail.
+# These lengths pin the boundary case on each side of W: W-1 has no vector
+# iterations at all, W has exactly one with no tail, W+1 has one plus a
+# one-element tail, and the large odd length exercises a long tail as well.
+# Kernel length 0 is exercised through the raw kernel calls below and through
+# the accept/autocorr paths; the public stretch wrapper rejects ns == 0.
+_SIMD_LENGTHS = [1, 3, 4, 5, 65_537]
+
+
+def _stretch_reference(sample, complement, scales, partners):
+    c = complement[partners]
+    proposal = c - (c - sample) * scales[:, None]
+    factors = (sample.shape[1] - 1.0) * np.log(scales)
+    return proposal, factors
+
+
+@pytest.mark.parametrize("ns", _SIMD_LENGTHS)
+def test_stretch_kernel_simd_and_tail_lengths(ns):
+    rng = np.random.default_rng(ns)
+    ndim = 4
+    sample = rng.normal(size=(ns, ndim))
+    complement = rng.normal(size=(9, ndim))
+    scales = rng.random(ns) * 1.9 + 1.0
+    partners = rng.integers(0, 9, size=ns).astype(np.int64)
+    proposal = np.empty_like(sample)
+    factors = np.empty(ns, dtype=np.float64)
+    _lib.stretch_proposal(
+        sample, complement, scales, partners, proposal, factors
+    )
+    want_proposal, want_factors = _stretch_reference(
+        sample, complement, scales, partners
+    )
+    assert proposal.shape == (ns, ndim)
+    # The vector body may contract c - (c - s) * z into an FMA, which is more
+    # accurate than NumPy's unfused expression; agreement is 1 ulp, far inside
+    # the parity budget the move is tested against.
+    assert np.allclose(proposal, want_proposal, rtol=0, atol=2e-15)
+    assert np.allclose(factors, want_factors, rtol=0, atol=1e-8)
+
+
+@pytest.mark.parametrize("ndim", _SIMD_LENGTHS)
+def test_stretch_kernel_simd_and_tail_row_widths(ndim):
+    rng = np.random.default_rng(1000 + ndim)
+    ns = 6
+    sample = rng.normal(size=(ns, ndim))
+    complement = rng.normal(size=(7, ndim))
+    scales = rng.random(ns) * 1.9 + 1.0
+    partners = rng.integers(0, 7, size=ns).astype(np.int64)
+    proposal = np.empty_like(sample)
+    factors = np.empty(ns, dtype=np.float64)
+    _lib.stretch_proposal(
+        sample, complement, scales, partners, proposal, factors
+    )
+    want_proposal, _ = _stretch_reference(
+        sample, complement, scales, partners
+    )
+    assert np.allclose(proposal, want_proposal, rtol=0, atol=2e-15)
+
+
+def test_stretch_kernel_leaves_output_untouched_at_zero_length():
+    sample = np.empty((0, 4))
+    complement = np.ones((3, 4))
+    scales = np.empty(0)
+    partners = np.empty(0, dtype=np.int64)
+    proposal = np.empty((0, 4))
+    factors = np.empty(0)
+    # Bypass the Python wrapper, which rejects an empty ensemble; this checks
+    # the exported kernel itself does no work at length zero.
+    status = _lib.lib().mem_stretch_proposal(
+        sample.ctypes.data,
+        complement.ctypes.data,
+        scales.ctypes.data,
+        partners.ctypes.data,
+        proposal.ctypes.data,
+        factors.ctypes.data,
+        0,
+        len(complement),
+        sample.shape[1],
+    )
+    assert status == -1
+    assert proposal.shape == (0, 4)
+    assert factors.shape == (0,)
+
+
+@pytest.mark.parametrize(
+    "ns, ndim",
+    [(0, 4), (1, 4), (3, 4), (4, 4), (5, 4), (65_537, 4),
+     (5, 1), (5, 3), (5, 5), (5, 65_537)],
+)
+def test_accept_kernel_simd_and_tail_lengths(ns, ndim):
+    rng = np.random.default_rng(2000 + ns + ndim)
+    nwalkers = max(ns, 1) + 3
+    coords = rng.normal(size=(nwalkers, ndim))
+    log_prob = rng.normal(size=nwalkers)
+    proposal = rng.normal(size=(ns, ndim))
+    proposal_log_prob = rng.normal(size=ns)
+    factors = rng.normal(size=ns)
+    log_uniform = rng.normal(size=ns)
+    indices = rng.permutation(nwalkers)[:ns].astype(np.int64)
+    accepted = np.zeros(nwalkers, dtype=np.int64)
+
+    want_coords = coords.copy()
+    want_log_prob = log_prob.copy()
+    want_accepted = accepted.copy()
+    want_count = 0
+    for i in range(ns):
+        j = indices[i]
+        if factors[i] + proposal_log_prob[i] - log_prob[j] > log_uniform[i]:
+            want_accepted[j] = 1
+            want_log_prob[j] = proposal_log_prob[i]
+            want_coords[j] = proposal[i]
+            want_count += 1
+
+    count = _lib.accept_proposals(
+        coords,
+        log_prob,
+        proposal,
+        proposal_log_prob,
+        factors,
+        log_uniform,
+        indices,
+        accepted,
+    )
+    assert count == want_count
+    assert np.array_equal(coords, want_coords)
+    assert np.array_equal(log_prob, want_log_prob)
+    assert np.array_equal(accepted, want_accepted)
+
+
+@pytest.mark.parametrize("n", [1, 3, 4, 5, 65_537])
+def test_autocorrelation_kernel_simd_and_tail_lengths(n):
+    values = np.random.default_rng(n).normal(size=n)
+    fft_size = 2 * memcee.autocorr.next_pow_two(n)
+    result = np.empty(n, dtype=np.float64)
+    work_real = np.empty(fft_size, dtype=np.float64)
+    work_imag = np.empty(fft_size, dtype=np.float64)
+    _lib.autocorrelation_1d(values, result, work_real, work_imag)
+    reference = emcee.autocorr.function_1d(values)
+    # A one-sample series has zero variance after mean removal, so both sides
+    # return NaN.
+    assert np.array_equal(np.isnan(result), np.isnan(reference))
+    finite = np.isfinite(reference)
+    if not np.any(finite):
+        return
+    # Tail of the correlation is ~1e-5 of acf[0], so a per-element atol would
+    # be meaningless there; compare against the signal magnitude instead. The
+    # two sides use different FFT traversals (DIF/DIT vs pocketfft rfft), so
+    # reordering alone sets this floor.
+    assert np.allclose(
+        result[finite],
+        reference[finite],
+        rtol=0,
+        atol=1e-6 * np.max(np.abs(reference[finite])),
+    )
+
+
+def test_autocorrelation_zero_padding_tail_is_zeroed():
+    n = 5
+    fft_size = 16
+    values = np.random.default_rng(6).normal(size=n)
+    result = np.empty(n, dtype=np.float64)
+    work_real = np.full(fft_size, np.nan)
+    work_imag = np.full(fft_size, np.nan)
+    _lib.autocorrelation_1d(values, result, work_real, work_imag)
+    assert np.all(np.isfinite(result))
+
+
 def test_backend_views_match_upstream():
     ours, theirs = paired_samplers()
     positions = initial_positions()
